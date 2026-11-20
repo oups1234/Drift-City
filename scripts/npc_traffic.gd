@@ -25,6 +25,13 @@ const RESPAWN_RADIUS := 330.0
 const HALF_W := 0.95
 const HALF_L := 2.1
 const MASS := 1600.0
+## Rayon de la zone de carrefour autour du centre d'un nœud : une voiture y
+## entre seulement après avoir réservé le carrefour (voir try_reserve).
+const ZONE := 3.5
+## Deux trajectoires de carrefour se croisent si elles passent à moins de ça.
+const CONFLICT_DIST := 3.5
+## Taille des cellules de la grille de collision (m).
+const CELL := 6.0
 const CarScript = preload("res://scripts/npc_car.gd")
 
 ## Sens avant de chaque prefab : -1 = avant en -Z, +1 = avant en +Z.
@@ -52,6 +59,19 @@ var _prefabs: Array = []
 var _flat_materials := {}
 ## Correspondance matériau simplifié -> matériau d'origine (pour le réactiver).
 var _orig_by_flat := {}
+## Voitures par arête (y compris celles dans la courbe de sortie de l'arête),
+## reconstruit à chaque pas : la recherche du véhicule devant ne parcourt
+## plus toute la flotte.
+var _by_edge: Array = []
+## Carrefour -> voitures qui l'ont réservé.
+var _occ := {}
+## Carrefour -> voitures qui attendent de pouvoir y entrer.
+var _waiters := {}
+## Après cette attente, une voiture d'une autre branche passe avant les
+## nouvelles voitures de la file qui roule (pas de famine).
+const FAIR_WAIT := 2.0
+## (arête, mouvement, arête, mouvement) -> les trajectoires se croisent ?
+var _conflicts := {}
 
 
 func _ready() -> void:
@@ -75,6 +95,7 @@ func set_count(count: int) -> void:
 	var target := clampi(count, 0, MAX_CARS)
 	while _cars.size() > target:
 		var car: Node = _cars.pop_back()
+		release(car)
 		car.queue_free()
 	while _cars.size() < target:
 		_spawn(_cars.size())
@@ -84,9 +105,217 @@ func set_count(count: int) -> void:
 func _physics_process(delta: float) -> void:
 	if _cars.is_empty():
 		return
+	_rebuild_buckets()
+	_update_reservations()
 	for car in _cars:
 		car.call("step", delta)
 	_collide_traffic()
+
+
+func _rebuild_buckets() -> void:
+	if _by_edge.size() != _edges.size():
+		_by_edge.resize(_edges.size())
+	for e in _edges.size():
+		_by_edge[e] = []
+	for car in _cars:
+		var e: int = car.edge
+		if e >= 0:
+			(_by_edge[e] as Array).append(car)
+
+
+## ---------------------------------------------------------------------------
+## Véhicule devant
+## ---------------------------------------------------------------------------
+
+## Écart (pare-chocs à pare-chocs) et vitesse du premier véhicule devant, sur
+## la voie actuelle, dans la courbe du carrefour puis sur la voie suivante.
+func leader_ahead(car) -> Array:
+	var e: int = car.edge
+	var elen: float = float((_edges[e] as Dictionary)["len"])
+	var p: float = float(car.s) if float(car.conn_s) < 0.0 else elen + float(car.conn_s)
+	var best := 1.0e9
+	var spd := 0.0
+	for o in (_by_edge[e] as Array):
+		if o == car:
+			continue
+		var po: float
+		if float(o.conn_s) < 0.0:
+			po = float(o.s)
+		elif int(o.move) == int(car.move) or float(o.conn_s) < 3.0:
+			po = elen + float(o.conn_s)
+		else:
+			continue
+		if po <= p:
+			continue
+		var gap := po - p - 2.0 * HALF_L
+		if gap < best:
+			best = gap
+			spd = float(o.speed)
+	if int(car.move) >= 0:
+		var mv := get_move(e, int(car.move))
+		var curve: Dictionary = mv.get("curve", {})
+		var clen: float = float(curve.get("len", 0.0))
+		if clen < 0.5:
+			clen = 0.0
+		var oe: int = int(mv["to"])
+		var base := elen + clen - p
+		var olen: float = float((_edges[oe] as Dictionary)["len"])
+		for o in (_by_edge[oe] as Array):
+			if o == car:
+				continue
+			var po: float = float(o.s) if float(o.conn_s) < 0.0 else olen + float(o.conn_s)
+			var gap := base + po - 2.0 * HALF_L
+			if gap < best:
+				best = gap
+				spd = float(o.speed)
+	return [maxf(best, 0.0), spd]
+
+
+## ---------------------------------------------------------------------------
+## Priorités aux carrefours
+## ---------------------------------------------------------------------------
+
+## Nœud au bout de l'arête de la voiture.
+func node_ahead(car) -> int:
+	return int((_edges[int(car.edge)] as Dictionary)["to"])
+
+
+## Vrai carrefour (3 branches ou plus) : priorités gérées.
+func is_gated(node: int) -> bool:
+	return (_adj[node] as Array).size() >= 3
+
+
+## Distance, depuis la position de la voiture, jusqu'à la ligne d'arrêt du
+## carrefour qui suit la voie de sortie, si c'est un vrai carrefour (sinon INF).
+## Les voies font 11,4 m : sans anticipation, une voiture sortie d'un
+## carrefour à pleine vitesse ne peut plus s'arrêter avant le suivant.
+func next_gate_distance(car, stop_line: float) -> float:
+	if int(car.move) < 0 or float(car.conn_s) >= 0.0:
+		return INF
+	var e: int = car.edge
+	var mv := get_move(e, int(car.move))
+	var oe: int = int(mv["to"])
+	if not is_gated(int((_edges[oe] as Dictionary)["to"])):
+		return INF
+	var clen: float = float((mv.get("curve", {}) as Dictionary).get("len", 0.0))
+	if clen < 0.5:
+		clen = 0.0
+	return edge_length(e) - float(car.s) + clen + edge_length(oe) - stop_line - HALF_L
+
+
+## Réserve le carrefour au bout de la voie si aucune voiture venant d'une
+## autre branche ne l'occupe sur une trajectoire qui croise la nôtre.
+## Les nœuds à 2 branches (route continue) n'ont pas de priorité.
+## Une voiture peut tenir deux carrefours (celui qu'elle quitte et le suivant :
+## les voies ne font que 11,4 m).
+func try_reserve(car, force: bool = false) -> bool:
+	var node := node_ahead(car)
+	if int(car.res_node) == node:
+		return true
+	if (_adj[node] as Array).size() < 3:
+		return true
+	var entries: Array = _occ.get(node, [])
+	var waiters: Dictionary = _waiters.get(node, {})
+	if not force:
+		for r in entries:
+			if r["car"] == car or int(r["from"]) == int(car.edge):
+				continue
+			if _conflict(int(car.edge), int(car.move), int(r["from"]), int(r["move"])):
+				waiters[car] = true
+				_waiters[node] = waiters
+				return false
+		# Équité : une voiture qui attend depuis longtemps sur une autre branche,
+		# sur une trajectoire qui croise la nôtre, passe d'abord.
+		for w in waiters.keys():
+			if w == car or not is_instance_valid(w) or int(w.edge) == int(car.edge):
+				continue
+			if node_ahead(w) != node or int(w.res_node) == node or int(w.move) < 0:
+				waiters.erase(w)
+				continue
+			if float(w.wait_time) > FAIR_WAIT and _conflict(int(car.edge), int(car.move), int(w.edge), int(w.move)):
+				waiters[car] = true
+				_waiters[node] = waiters
+				return false
+	waiters.erase(car)
+	entries.append({
+		"car": car, "from": int(car.edge), "move": int(car.move),
+		"to": int(get_move(int(car.edge), int(car.move)).get("to", -1)),
+	})
+	_occ[node] = entries
+	car.res_node = node
+	return true
+
+
+## Libère tous les carrefours tenus par la voiture.
+func release(car) -> void:
+	for node in _occ.keys():
+		var entries: Array = _occ[node]
+		for i in range(entries.size() - 1, -1, -1):
+			if entries[i]["car"] == car:
+				entries.remove_at(i)
+	for node in _waiters.keys():
+		(_waiters[node] as Dictionary).erase(car)
+	car.res_node = -1
+
+
+## Libère les carrefours que les voitures ont quittés.
+func _update_reservations() -> void:
+	for node in _occ.keys():
+		var entries: Array = _occ[node]
+		for i in range(entries.size() - 1, -1, -1):
+			var r: Dictionary = entries[i]
+			var car = r["car"]
+			if not is_instance_valid(car):
+				entries.remove_at(i)
+				continue
+			var e: int = car.edge
+			if e == int(r["from"]):
+				continue
+			if e == int(r["to"]) and float(car.conn_s) < 0.0 and float(car.s) < ZONE + HALF_L:
+				continue
+			entries.remove_at(i)
+			if int(car.res_node) == int(node):
+				car.res_node = -1
+
+
+func _conflict(e1: int, m1: int, e2: int, m2: int) -> bool:
+	var key := Vector4i(e1, m1, e2, m2)
+	if _conflicts.has(key):
+		return _conflicts[key]
+	var a := _move_path(e1, m1)
+	var b := _move_path(e2, m2)
+	var hit := int(get_move(e1, m1).get("to", -1)) == int(get_move(e2, m2).get("to", -2))
+	if not hit:
+		for pa in a:
+			for pb in b:
+				if (pa as Vector2).distance_to(pb) < CONFLICT_DIST:
+					hit = true
+					break
+			if hit:
+				break
+	_conflicts[key] = hit
+	_conflicts[Vector4i(e2, m2, e1, m1)] = hit
+	return hit
+
+
+## Points de la trajectoire dans la zone de carrefour : fin de voie, courbe,
+## début de la voie suivante.
+func _move_path(e: int, m: int) -> PackedVector2Array:
+	var pts := PackedVector2Array()
+	var elen := edge_length(e)
+	for k in 4:
+		pts.append(lane_point(e, maxf(0.0, elen - ZONE + ZONE * float(k) / 3.0))[0])
+	var mv := get_move(e, m)
+	if mv.is_empty():
+		return pts
+	var curve: Dictionary = mv.get("curve", {})
+	if float(curve.get("len", 0.0)) > 0.5:
+		for k in range(1, 8):
+			pts.append(curve_point(curve, float(curve["len"]) * float(k) / 8.0)[0])
+	var oe: int = int(mv["to"])
+	for k in 4:
+		pts.append(lane_point(oe, minf(edge_length(oe), ZONE * float(k) / 3.0))[0])
+	return pts
 
 
 ## ---------------------------------------------------------------------------
@@ -414,8 +643,26 @@ func _collide_traffic() -> void:
 		cars.append(player)
 		bodies.append(_player_body(player as Node3D))
 
-	for i in cars.size():
-		for j in range(i + 1, cars.size()):
+	# Grille spatiale : on ne teste que les voitures des cellules voisines.
+	var grid := {}
+	for i in bodies.size():
+		var key := Vector2i(floori(float(bodies[i]["x"]) / CELL), floori(float(bodies[i]["z"]) / CELL))
+		if not grid.has(key):
+			grid[key] = []
+		(grid[key] as Array).append(i)
+	var pairs: Array = []
+	for i in bodies.size():
+		var cx := floori(float(bodies[i]["x"]) / CELL)
+		var cz := floori(float(bodies[i]["z"]) / CELL)
+		for dx in range(-1, 2):
+			for dz in range(-1, 2):
+				for j in grid.get(Vector2i(cx + dx, cz + dz), []):
+					if j > i:
+						pairs.append(Vector2i(i, j))
+	for pair in pairs:
+		var i: int = pair.x
+		var j: int = pair.y
+		if true:
 			var a: Dictionary = bodies[i]
 			var b: Dictionary = bodies[j]
 			var reach: float = float(a["halfL"]) + float(b["halfL"]) + 1.0
@@ -429,6 +676,12 @@ func _collide_traffic() -> void:
 			var nx: float = hit["nx"]
 			var nz: float = hit["nz"]
 			var share: float = float(b["mass"]) / (float(a["mass"]) + float(b["mass"]))
+			# Contact par l'avant : compté pour que la voiture se dégage en
+			# reculant si le blocage dure (voir npc_car.front_contact).
+			if i < _cars.size():
+				_front_contact(cars[i], -nx, -nz)
+			if j < _cars.size():
+				_front_contact(cars[j], nx, nz)
 			if i < _cars.size():
 				_apply_body(cars[i], a, nx, nz)
 				shove(cars[i], nx * depth * share, nz * depth * share)
@@ -513,6 +766,12 @@ func _resolve_impulse(a: Dictionary, b: Dictionary, hit: Dictionary) -> float:
 	b["vz"] = float(b["vz"]) - tz * friction * inv_b
 	b["angularVel"] = float(b["angularVel"]) - tangent_b * friction * inertia_b
 	return closing
+
+
+## (ox, oz) : direction de l'obstacle vu depuis la voiture.
+func _front_contact(car, ox: float, oz: float) -> void:
+	if sin(float(car.yaw)) * ox + cos(float(car.yaw)) * oz > 0.5:
+		car.front_contact = float(car.front_contact) + 1.0 / float(Engine.physics_ticks_per_second)
 
 
 func _apply_body(car, body: Dictionary, nx: float, nz: float) -> void:
@@ -651,15 +910,28 @@ func _random_start() -> Array:
 		if (edge["moves"] as Array).is_empty():
 			continue
 		var s := randf_range(1.0, float(edge["len"]) - 3.0)
+		if not _spawn_ok(e, s):
+			continue
 		var pos: Vector2 = lane_point(e, s)[0]
 		if pos.distance_to(pp) < SAFE_RADIUS:
 			continue
 		if _lane_clear(e, s, 9.0):
 			return [e, s]
 	for e in _edges.size():
-		if not (_edges[e] as Dictionary)["moves"].is_empty() and _lane_clear(e, 2.0, 5.0):
+		if not (_edges[e] as Dictionary)["moves"].is_empty() and _spawn_ok(e, 2.0) and _lane_clear(e, 2.0, 5.0):
 			return [e, 2.0]
 	return []
+
+
+## Pas d'apparition dans une zone de carrefour ni juste avant sa ligne d'arrêt :
+## la voiture devrait y forcer le passage et se bloquer contre le trafic.
+func _spawn_ok(e: int, s: float) -> bool:
+	var edge: Dictionary = _edges[e]
+	if is_gated(int(edge["from"])) and s < ZONE + HALF_L + 1.0:
+		return false
+	if is_gated(int(edge["to"])) and s > float(edge["len"]) - 6.0 - HALF_L - 2.0:
+		return false
+	return true
 
 
 func _lane_clear(e: int, s: float, margin: float) -> bool:
@@ -675,6 +947,8 @@ func recycle(car) -> void:
 	if pick.is_empty():
 		return
 	var e: int = pick[0]
+	release(car)
+	car.wait_time = 0.0
 	car.edge = e
 	car.move = -1
 	car.conn_s = -1.0

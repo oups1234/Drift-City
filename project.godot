@@ -49,6 +49,10 @@ wavefront_obj={
 "scale_mesh": Vector3(1, 1, 1)
 }
 
+[physics]
+
+common/physics_interpolation=true
+
 [rendering]
 
 renderer/rendering_method="gl_compatibility"

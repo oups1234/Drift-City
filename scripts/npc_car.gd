@@ -54,6 +54,22 @@ var stalled := 0.0
 var reverse_left := 0.0
 var reverse_spin := 1.0
 var prev_pos := Vector2.ZERO
+## Dernier carrefour réservé (voir npc_traffic.try_reserve).
+var res_node := -1
+## Temps passé à attendre à l'entrée d'un carrefour.
+var wait_time := 0.0
+## Temps cumulé de contact par l'avant (choc qui se répète contre une voiture
+## en travers) : au-delà de FRONT_CONTACT_MAX, on recule pour se dégager.
+var front_contact := 0.0
+const FRONT_CONTACT_MAX := 0.5
+## Au-delà, on passe quand même (évite tout blocage définitif).
+const MAX_WAIT := 6.0
+## Distance au centre du carrefour où s'arrête le pare-chocs avant pour
+## laisser passer : assez loin pour ne pas être accroché par une voiture qui
+## tourne (sa carrosserie déborde de la voie dans le virage).
+const STOP_LINE := 6.0
+## Rayon de la zone de croisement (doit valoir npc_traffic.ZONE).
+const ZONE := 3.5
 
 
 func setup(mgr: Node, e: int, start_s: float, desired: float, sign_front: float) -> void:
@@ -70,6 +86,8 @@ func setup(mgr: Node, e: int, start_s: float, desired: float, sign_front: float)
 	prev_pos = pos
 	global_position = Vector3(pos.x, 0.02, pos.y)
 	_apply_rotation()
+	# (Re)placement : pas d'interpolation depuis l'ancienne position.
+	reset_physics_interpolation()
 
 
 func step(delta: float) -> void:
@@ -83,7 +101,8 @@ func step(delta: float) -> void:
 			out_edge = int(manager.call("get_move", edge, move)["to"])
 
 	# --- Intelligent Driver Model ------------------------------------------
-	var lead: Array = manager.call("leader", self)
+	# Véhicule devant : voie actuelle, courbe du carrefour et voie suivante.
+	var lead: Array = manager.call("leader_ahead", self)
 	gap = float(lead[0])
 	leader_speed = float(lead[1])
 	var worst := 0.0
@@ -91,7 +110,8 @@ func step(delta: float) -> void:
 		worst = _brake(gap, leader_speed)
 
 	var cap := 1.0e9
-	var d_end: float = float(manager.call("edge_length", edge)) - s - HALF_L
+	var edge_len: float = float(manager.call("edge_length", edge))
+	var d_end: float = edge_len - s - HALF_L
 	if move >= 0:
 		var curve: Dictionary = manager.call("get_move", edge, move).get("curve", {})
 		if not curve.is_empty() and float(curve["len"]) > 0.5 and float(curve["curv"]) > 0.001:
@@ -100,11 +120,30 @@ func step(delta: float) -> void:
 				cap = vt
 			else:
 				cap = sqrt(vt * vt + 5.0 * maxf(0.0, d_end))
-		# Le véhicule déjà sorti du carrefour sur la voie suivante.
-		if conn_s < 0.0 and d_end < 6.0:
-			var next_lead: Array = manager.call("leader_on", self, out_edge, 0.0)
-			if float(next_lead[0]) < LOOKAHEAD:
-				worst = minf(worst, _brake(float(next_lead[0]), float(next_lead[1])))
+
+	# --- Priorité au carrefour ---------------------------------------------
+	# Distance du pare-chocs avant à la zone de carrefour.
+	var stop_gap := INF
+	var gated := false
+	if conn_s < 0.0 and move >= 0 and res_node != int(manager.call("node_ahead", self)):
+		stop_gap = edge_len - STOP_LINE - s - HALF_L
+		var approach := maxf(speed, 0.0) * maxf(speed, 0.0) / (2.0 * B) + 3.0
+		if stop_gap < approach:
+			# Forcer seulement en dernier recours : attente trop longue, ou déjà
+			# engagée dans la zone de croisement (et non à la ligne d'arrêt).
+			var in_zone := edge_len - ZONE - s - HALF_L < -0.5
+			var force := wait_time > MAX_WAIT or in_zone
+			if bool(manager.call("try_reserve", self, force)):
+				wait_time = 0.0
+			else:
+				gated = true
+				wait_time += delta
+				worst = minf(worst, _brake(maxf(stop_gap, 0.1), 0.0, 0.5, 0.6))
+	elif conn_s < 0.0 and move >= 0:
+		# Carrefour d'après : on arrive assez lentement pour pouvoir s'y arrêter.
+		var d2: float = float(manager.call("next_gate_distance", self, STOP_LINE))
+		if d2 < 30.0:
+			worst = minf(worst, _brake(maxf(d2, 0.1), 0.0, 0.5, 0.6))
 
 	var free := A * (1.0 - pow(speed / maxf(v0, 0.1), 4.0))
 	acc = clampf(minf(free + worst, (cap - speed) * 2.0), -B_MAX, A)
@@ -124,6 +163,9 @@ func step(delta: float) -> void:
 		if ds > allowed:
 			ds = allowed
 			speed = minf(speed, maxf(0.0, leader_speed))
+	if gated and ds > maxf(0.0, stop_gap):
+		ds = maxf(0.0, stop_gap)
+		speed = minf(speed, ds / maxf(delta, 0.001))
 	manager.call("advance", self, ds)
 
 	# --- Direction vers un point anticipé ----------------------------------
@@ -153,13 +195,20 @@ func step(delta: float) -> void:
 	manager.call("locate", self, delta)
 
 	# --- Déblocage : reculer en tournant -----------------------------------
+	# Seulement si la voiture veut avancer et n'est retenue ni par le véhicule
+	# devant ni par un carrefour : attendre dans une file n'est pas être coincé.
 	var moved := Vector2(global_position.x, global_position.z).distance_to(prev_pos)
-	if moved < 0.012:
+	var waiting := gated or gap < S0 + 2.5
+	if moved < 0.012 and not waiting:
 		stalled += delta
 		if stalled > 0.9 and reverse_left <= 0.0 and impact_time <= 0.0:
 			_begin_reverse()
 	else:
 		stalled = 0.0
+	if front_contact > FRONT_CONTACT_MAX and reverse_left <= 0.0:
+		_begin_reverse()
+		front_contact = 0.0
+	front_contact = maxf(0.0, front_contact - 0.25 * delta)
 
 
 func _begin_reverse() -> void:

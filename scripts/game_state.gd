@@ -8,7 +8,7 @@ extends Node
 const SAVE_PATH := "user://progress.cfg"
 const MIN_NPC := 0
 const MAX_NPC := 100
-const DEFAULT_NPC := 16
+const DEFAULT_NPC := 40
 
 var selected_car_id := "aveo"
 var wallet := 0

@@ -6,7 +6,15 @@ extends RefCounted
 ## à la longueur demandée. Renvoie un Node3D avec la métadonnée "size".
 
 
+## Version pré-cuite par tools/bake_car_models.gd (décimée, surfaces fusionnées).
+const BAKED_DIR := "res://assets/cars/baked"
+
+
 static func build(spec: Dictionary) -> Node3D:
+	if not bool(spec.get("raw", false)):
+		var baked := _load_baked(spec)
+		if baked != null:
+			return baked
 	var root := Node3D.new()
 	root.name = "CarModel"
 
@@ -68,6 +76,32 @@ static func build(spec: Dictionary) -> Node3D:
 	root.add_child(wrapper)
 	root.set_meta("size", moved.size)
 	var wheels: Array = WheelRig.attach(root, wrapper, spec)
+	root.set_meta("wheels", wheels)
+	return root
+
+
+static func _load_baked(spec: Dictionary) -> Node3D:
+	var path := "%s/%s.scn" % [BAKED_DIR, String(spec.get("id", ""))]
+	if not ResourceLoader.exists(path):
+		return null
+	var packed := load(path) as PackedScene
+	if packed == null:
+		return null
+	var root := packed.instantiate() as Node3D
+	# Les roues sont des nœuds de la scène : on reconstruit leurs descripteurs.
+	var wheels: Array = []
+	var rig := root.get_node_or_null("WheelRig")
+	var data: Dictionary = spec.get("wheels", {})
+	if rig != null:
+		for steer in rig.get_children():
+			var center: Vector3 = (steer as Node3D).position
+			wheels.append({
+				"pivot": steer,
+				"spin": steer.get_node("Spin"),
+				"front": center.z < 0.0,
+				"radius": float(data.get("spin_radius", data.get("radius", 0.32))),
+				"center": center,
+			})
 	root.set_meta("wheels", wheels)
 	return root
 

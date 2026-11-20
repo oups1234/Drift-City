@@ -121,6 +121,8 @@ func reset_to_spawn() -> void:
 	_water_sink = 0.0
 	_last_land_position = global_position
 	_last_land_yaw = rotation.y
+	# Téléportation : pas d'interpolation entre l'ancienne et la nouvelle place.
+	reset_physics_interpolation()
 	if hud:
 		hud.hide_limit()
 	drifting = false
@@ -211,6 +213,7 @@ func _return_to_last_land() -> void:
 	global_position = _last_land_position
 	global_position.y = _ground_height_at(global_position) + 0.02
 	rotation.y = _last_land_yaw
+	reset_physics_interpolation()
 	velocity = Vector3.ZERO
 	_fall_speed = 0.0
 	_forward_speed = 0.0
@@ -479,13 +482,16 @@ func _input(event: InputEvent) -> void:
 			_cam_dist = clampf(_cam_dist / CAM_ZOOM_FACTOR, CAM_ZOOM_MIN, CAM_ZOOM_MAX)
 
 
+## La voiture bouge au rythme de la physique (60 Hz) mais la caméra à chaque
+## image (jusqu'à 120 Hz et plus) : on suit la position interpolée, sinon la
+## voiture avance une image sur deux et la caméra tremble.
 func _camera_pivot() -> Vector3:
-	return global_position + Vector3.UP * (_car_height * 0.5)
+	return get_global_transform_interpolated().origin + Vector3.UP * (_car_height * 0.5)
 
 
 func _camera_desired() -> Vector3:
 	var pivot := _camera_pivot()
-	var heading := -global_transform.basis.z
+	var heading := -get_global_transform_interpolated().basis.z
 	var orbit := Basis(Vector3.UP, _cam_yaw) * heading
 	var back := -orbit.normalized()
 	var horiz := cos(_cam_pitch) * _cam_dist
@@ -524,6 +530,8 @@ func _build_camera() -> void:
 	_camera.near = 0.15
 	_camera.far = 2400.0
 	_camera.current = true
+	# Placée à la main dans _process à partir de la pose interpolée.
+	_camera.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	add_child(_camera)
 
 
